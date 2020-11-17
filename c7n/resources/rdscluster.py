@@ -1,19 +1,10 @@
-# Copyright 2016-2019 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 import logging
 
 from concurrent.futures import as_completed
+from datetime import datetime
+from dateutil.tz import tzutc
 
 from c7n.actions import BaseAction
 from c7n.filters import AgeFilter, CrossAccountAccessFilter
@@ -74,12 +65,20 @@ class SecurityGroupFilter(net_filters.SecurityGroupFilter):
 class SubnetFilter(net_filters.SubnetFilter):
 
     RelatedIdsExpression = ""
+    groups = None
 
     def get_permissions(self):
         return self.manager.get_resource_manager(
             'rds-subnet-group').get_permissions()
 
+    def get_subnet_groups(self):
+        return {
+            r['DBSubnetGroupName']: r for r in
+            self.manager.get_resource_manager('rds-subnet-group').resources()}
+
     def get_related_ids(self, resources):
+        if not self.groups:
+            self.groups = self.get_subnet_groups()
         group_ids = set()
         for r in resources:
             group_ids.update(
@@ -88,9 +87,8 @@ class SubnetFilter(net_filters.SubnetFilter):
         return group_ids
 
     def process(self, resources, event=None):
-        self.groups = {
-            r['DBSubnetGroupName']: r for r in
-            self.manager.get_resource_manager('rds-subnet-group').resources()}
+        if not self.groups:
+            self.groups = self.get_subnet_groups()
         return super(SubnetFilter, self).process(resources, event)
 
 
@@ -360,6 +358,31 @@ class DescribeClusterSnapshot(DescribeSource):
         return tags.universal_augment(self.manager, resources)
 
 
+class ConfigClusterSnapshot(ConfigSource):
+
+    def load_resource(self, item):
+
+        resource = super(ConfigClusterSnapshot, self).load_resource(item)
+        # db cluster snapshots are particularly mangled on keys
+        for k, v in list(resource.items()):
+            if k.startswith('Dbcl'):
+                resource.pop(k)
+                k = 'DBCl%s' % k[4:]
+                resource[k] = v
+            elif k.startswith('Iamd'):
+                resource.pop(k)
+                k = 'IAMD%s' % k[4:]
+                resource[k] = v
+        resource['Tags'] = [{'Key': k, 'Value': v} for k, v in item['tags'].items()]
+
+        utc = tzutc()
+        resource['SnapshotCreateTime'] = datetime.fromtimestamp(
+            resource['SnapshotCreateTime'] / 1000, tz=utc)
+        resource['ClusterCreateTime'] = datetime.fromtimestamp(
+            resource['ClusterCreateTime'] / 1000, tz=utc)
+        return resource
+
+
 @resources.register('rds-cluster-snapshot')
 class RDSClusterSnapshot(QueryResourceManager):
     """Resource manager for RDS cluster snapshots.
@@ -374,13 +397,13 @@ class RDSClusterSnapshot(QueryResourceManager):
             'describe_db_cluster_snapshots', 'DBClusterSnapshots', None)
         name = id = 'DBClusterSnapshotIdentifier'
         date = 'SnapshotCreateTime'
-        universal_tagging = object()
+        universal_taggable = object()
         config_type = 'AWS::RDS::DBClusterSnapshot'
         permissions_enum = ('rds:DescribeDBClusterSnapshots',)
 
     source_mapping = {
         'describe': DescribeClusterSnapshot,
-        'config': ConfigSource
+        'config': ConfigClusterSnapshot
     }
 
 

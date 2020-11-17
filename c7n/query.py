@@ -1,21 +1,11 @@
-# Copyright 2016-2017 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 """
 Query capability built on skew metamodel
 
 tags_spec -> s3, elb, rds
 """
+from concurrent.futures import as_completed
 import functools
 import itertools
 import json
@@ -347,11 +337,62 @@ class ConfigSource:
         return {'expr': s}
 
     def load_resource(self, item):
+        item_config = self._load_item_config(item)
+        resource = camelResource(item_config, implicitDate=True)
+        self._load_resource_tags(resource, item)
+        return resource
+
+    def _load_item_config(self, item):
         if isinstance(item['configuration'], str):
             item_config = json.loads(item['configuration'])
         else:
             item_config = item['configuration']
-        return camelResource(item_config)
+        return item_config
+
+    def _load_resource_tags(self, resource, item):
+        # normalized tag loading across the many variants of config's inconsistencies.
+        if 'Tags' in resource:
+            return
+        elif item.get('tags'):
+            resource['Tags'] = [
+                {u'Key': k, u'Value': v} for k, v in item['tags'].items()]
+        elif item['supplementaryConfiguration'].get('Tags'):
+            stags = item['supplementaryConfiguration']['Tags']
+            if isinstance(stags, str):
+                stags = json.loads(stags)
+            if isinstance(stags, list):
+                resource['Tags'] = [{u'Key': t['key'], u'Value': t['value']} for t in stags]
+            elif isinstance(stags, dict):
+                resource['Tags'] = [{u'Key': k, u'Value': v} for k, v in stags.items()]
+
+    def get_listed_resources(self, client):
+        # fallback for when config decides to arbitrarily break select
+        # resource for a given resource type.
+        paginator = client.get_paginator('list_discovered_resources')
+        paginator.PAGE_ITERATOR_CLS = RetryPageIterator
+        pages = paginator.paginate(
+            resourceType=self.manager.get_model().config_type)
+        results = []
+
+        with self.manager.executor_factory(max_workers=2) as w:
+            ridents = pages.build_full_result()
+            resource_ids = [
+                r['resourceId'] for r in ridents.get('resourceIdentifiers', ())]
+            self.manager.log.debug(
+                "querying %d %s resources",
+                len(resource_ids),
+                self.manager.__class__.__name__.lower())
+
+            for resource_set in chunks(resource_ids, 50):
+                futures = []
+                futures.append(w.submit(self.get_resources, resource_set))
+                for f in as_completed(futures):
+                    if f.exception():
+                        self.manager.log.error(
+                            "Exception getting resources from config \n %s" % (
+                                f.exception()))
+                    results.extend(f.result())
+        return results
 
     def resources(self, query=None):
         client = local_session(self.manager.session_factory).client('config')
@@ -367,6 +408,12 @@ class ConfigSource:
         for page in pager.paginate(Expression=query['expr']):
             results.extend([
                 self.load_resource(json.loads(r)) for r in page['Results']])
+
+        # Config arbitrarily breaks which resource types its supports for query/select
+        # on any given day, if we don't have a user defined query, then fallback
+        # to iteration mode.
+        if not results and query == self.get_query_params({}):
+            results = self.get_listed_resources(client)
         return results
 
     def augment(self, resources):
@@ -390,6 +437,7 @@ class QueryResourceManager(ResourceManager, metaclass=QueryMeta):
             'ThrottlingException',
             'RequestLimitExceeded',
             'Throttled',
+            'ThrottledException',
             'Throttling',
             'Client.RequestLimitExceeded')))
 
@@ -464,7 +512,8 @@ class QueryResourceManager(ResourceManager, metaclass=QueryMeta):
             if augment:
                 with self.ctx.tracer.subsegment('resource-augment'):
                     resources = self.augment(resources)
-            self._cache.save(cache_key, resources)
+                # Don't pollute cache with unaugmented resources.
+                self._cache.save(cache_key, resources)
 
         resource_count = len(resources)
         with self.ctx.tracer.subsegment('filter'):

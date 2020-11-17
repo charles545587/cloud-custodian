@@ -1,22 +1,31 @@
-# Copyright 2016-2017 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 import time
 from .common import BaseTest, functional, event_data
 from unittest.mock import MagicMock
 
 from botocore.exceptions import ClientError as BotoClientError
 from c7n.exceptions import PolicyValidationError
+from c7n.resources.aws import shape_validate
+from pytest_terraform import terraform
+
+
+@terraform('aws_code_build_vpc')
+def test_codebuild_unused(test, aws_code_build_vpc):
+    factory = test.replay_flight_data("test_security_group_codebuild_unused")
+    p = test.load_policy(
+        {"name": "sg-unused", "resource": "security-group", "filters": ["unused"]},
+        session_factory=factory,
+    )
+    unused = p.resource_manager.filters[0]
+    test.patch(
+        unused,
+        'get_scanners',
+        lambda: (('codebuild', unused.get_codebuild_sgs),))
+    resources = p.run()
+    sg_names = [resource['GroupName'] for resource in resources]
+    assert 'example2' in sg_names
+    assert 'example1' not in sg_names
 
 
 class VpcTest(BaseTest):
@@ -90,23 +99,25 @@ class VpcTest(BaseTest):
         resources = p.resource_manager.resources()
         post_finding = p.resource_manager.actions[0]
         formatted = post_finding.format_resource(resources[0])
-        formatted['Details']['Other'].pop('Tags')
-        formatted['Details']['Other'].pop('CidrBlockAssociationSet')
+        self.maxDiff = None
         self.assertEqual(
             formatted,
-            {'Details': {'Other': {'CidrBlock': '10.0.42.0/24',
-                                   'DhcpOptionsId': 'dopt-24ff1940',
-                                   'InstanceTenancy': 'default',
-                                   'IsDefault': 'False',
-                                   'OwnerId': '644160558196',
-                                   'State': 'available',
-                                   'VpcId': 'vpc-f1516b97',
-                                   'c7n:resource-type': 'vpc'}},
+            {'Details': {
+                'AwsEc2Vpc': {
+                    'DhcpOptionsId': 'dopt-24ff1940',
+                    'State': 'available',
+                    'CidrBlockAssociationSet': [{
+                        'AssociationId': 'vpc-cidr-assoc-98ba93f0',
+                        'CidrBlock': '10.0.42.0/24',
+                        'CidrBlockState': 'associated'}]}},
              'Id': 'arn:aws:ec2:us-east-1:644160558196:vpc/vpc-f1516b97',
              'Partition': 'aws',
              'Region': 'us-east-1',
              'Tags': {'Name': 'FancyTestVPC', 'tagfancykey': 'tagfanncyvalue'},
              'Type': 'AwsEc2Vpc'})
+        shape_validate(
+            formatted['Details']['AwsEc2Vpc'],
+            'AwsEc2VpcDetails', 'securityhub')
 
     def test_flow_logs_s3_destination(self):
         factory = self.replay_flight_data('test_vpc_flow_log_s3_dest')
@@ -257,6 +268,46 @@ class VpcTest(BaseTest):
         resources = p.run()
         self.assertEqual([len(resources), resources[0]["VpcId"]], [1, "vpc-7af45101"])
         self.assertTrue("c7n:DhcpConfiguration" in resources[0])
+
+    def test_vpc_endpoint_filter(self):
+        factory = self.replay_flight_data("test_vpc_endpoint_filter")
+        p = self.load_policy(
+            {
+                "name": "vpc-endpoint-filter",
+                "resource": "vpc",
+                "filters": [
+                    {
+                        "type": "vpc-endpoint",
+                        "key": "ServiceName",
+                        "value": "com.amazonaws.us-east-1.s3",
+                    }
+                ],
+            },
+            session_factory=factory,
+        )
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertTrue("vpc-072f438c953672ace" in resources[0]["c7n:matched-vpc-endpoint"])
+
+    def test_subnet_endpoint_filter(self):
+        factory = self.replay_flight_data("test_subnet_endpoint_filter")
+        p = self.load_policy(
+            {
+                "name": "subnet-endpoint-filter",
+                "resource": "subnet",
+                "filters": [
+                    {
+                        "type": "vpc-endpoint",
+                        "key": "ServiceName",
+                        "value": "com.amazonaws.us-east-1.athena",
+                    }
+                ],
+            },
+            session_factory=factory,
+        )
+        resources = p.run()
+        self.assertEqual(len(resources), 2)
+        self.assertTrue("subnet-068dfbf3f275a6ae8" in resources[0]["c7n:matched-vpc-endpoint"])
 
 
 class NetworkLocationTest(BaseTest):
@@ -532,6 +583,30 @@ class NetworkLocationTest(BaseTest):
                 {"security-groups": {web_sg_id: "web"},
                 "resource": None,
                 "reason": "SecurityGroupMismatch"}],
+        )
+
+    def test_network_compare_location_resource_missing(self):
+        self.factory = self.replay_flight_data("test_network_compare_location_resource_missing")
+        p = self.load_policy(
+            {
+                "name": "compare",
+                "resource": "aws.app-elb",
+                "filters": [
+                    {"type": "network-location", "key": "tag:NetworkLocation",
+                     "compare": ["subnet", "security-group"]}
+                ],
+            },
+            session_factory=self.factory,
+        )
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        matched = resources.pop()
+        self.assertEqual(
+            matched["c7n:NetworkLocation"],
+            [
+                {'reason': 'LocationMismatch', 'security-groups': {},
+                 'subnets': {'subnet-914763e7': 'Public', 'subnet-efbcccb7': 'Public'}}
+            ],
         )
 
     @functional
@@ -866,6 +941,15 @@ class NetworkAddrTest(BaseTest):
         network_addr = ec2.allocate_address(Domain="vpc")
         self.addCleanup(self.release_if_still_present, ec2, network_addr)
         self.assert_policy_released(factory, ec2, network_addr)
+
+    def test_elastic_ip_get_resources(self):
+        factory = self.replay_flight_data('test_elasticip_get_resources')
+        p = self.load_policy({
+            'name': 'get-addresses',
+            'resource': 'network-addr'},
+            session_factory=factory)
+        resources = p.resource_manager.get_resources(['eipalloc-0da931198e499fdb0'])
+        self.assertJmes('[0].PrivateIpAddress', resources, '192.168.0.99')
 
     def test_elasticip_error(self):
         mock_factory = MagicMock()
@@ -2564,7 +2648,8 @@ class EndpointTest(BaseTest):
                 'name': 'vpc-endpoint-cross-account',
                 'resource': 'vpc-endpoint',
                 'filters': [
-                    {'type': 'cross-account'}
+                    {'type': 'cross-account',
+                     'whitelist_orgids': ['o-4amkskbcf1']}
                 ]
             },
             session_factory=session_factory
@@ -2739,6 +2824,48 @@ class NATGatewayTest(BaseTest):
             session_factory=factory,
         )
         resources = p.run()
+        self.assertEqual(len(resources), 1)
+
+    def test_nat_gateways_metrics_filter(self):
+        factory = self.replay_flight_data("test_nat_gateways_metrics_filter")
+        p = self.load_policy(
+            {
+                "name": "nat-gateways-no-connections",
+                "resource": "nat-gateway",
+                "filters": [
+                    {
+                        "type": "metrics",
+                        "name": "ActiveConnectionCount",
+                        "op": "lt",
+                        "value": 100,
+                        "statistics": "Sum",
+                        "days": 1
+                    }
+                ],
+            },
+            session_factory=factory,
+        )
+        resources = p.run()
+        self.assertEqual(len(resources), 0)
+
+        p1 = self.load_policy(
+            {
+                "name": "nat-gateways-no-connections",
+                "resource": "nat-gateway",
+                "filters": [
+                    {
+                        "type": "metrics",
+                        "name": "ActiveConnectionCount",
+                        "op": "gt",
+                        "value": 100,
+                        "statistics": "Sum",
+                        "days": 1
+                    }
+                ],
+            },
+            session_factory=factory,
+        )
+        resources = p1.run()
         self.assertEqual(len(resources), 1)
 
 
